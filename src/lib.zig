@@ -2987,6 +2987,9 @@ pub fn Database(comptime db_kind: DatabaseKind, comptime HashInt: type) type {
                     size: u64,
                     start_position: u64,
                     pos: u64,
+                    // a short value is read from here, because it is stored in the
+                    // cursor's slot, which may have no position
+                    short_bytes: ?[byteSizeOf(u64)]u8 = null,
 
                     pub fn seekTo(self: *Reader, offset: u64) !void {
                         const logical_pos = self.logicalPos();
@@ -3011,6 +3014,13 @@ pub fn Database(comptime db_kind: DatabaseKind, comptime HashInt: type) type {
 
                         const new_limit: std.Io.Limit = .limited64(@min(@backingInt(limit), r.size - r.pos));
                         const dest = new_limit.slice(try io_w.writableSliceGreedy(1));
+
+                        if (r.short_bytes) |*short_bytes| {
+                            @memcpy(dest, short_bytes[@intCast(r.pos)..][0..dest.len]);
+                            r.pos += dest.len;
+                            io_w.advance(dest.len);
+                            return dest.len;
+                        }
 
                         var core_reader = r.parent.db.core.reader();
                         core_reader.seekTo(r.start_position + r.pos) catch return error.ReadFailed;
@@ -3417,9 +3427,10 @@ pub fn Database(comptime db_kind: DatabaseKind, comptime HashInt: type) type {
                                     .end = 0,
                                 },
                                 .size = value_size,
-                                // add one to get past the tag byte
-                                .start_position = (slot_ptr.position orelse return error.ExpectedSlotPosition) + 1,
+                                // nothing is read from the database
+                                .start_position = 0,
                                 .pos = 0,
+                                .short_bytes = bytes,
                             };
                         },
                         else => return error.UnexpectedTag,
