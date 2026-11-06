@@ -3450,11 +3450,13 @@ pub fn Database(comptime db_kind: DatabaseKind, comptime HashInt: type) type {
                 pub fn readKeyValuePair(self: Cursor(write_mode)) !KeyValuePairCursor(write_mode) {
                     const slot_ptr = try self.resolved();
                     const kv_pair = try self.db.readKvPair(slot_ptr.slot);
+                    // a key-only entry is its own key slot, so its key is where the entry is.
+                    // a sorted pair's key is immutable, so it has no writeable position (see `sortedTargetSlot`)
+                    const key_position = if (slot_ptr.slot.tag == .sorted_kv_pair) null else kvKeyPosition(slot_ptr.slot) orelse slot_ptr.position;
 
                     return .{
                         .value_cursor = .{ .slot_ptr = .{ .position = kvValuePosition(slot_ptr.slot), .slot = kv_pair.value_slot }, .db = self.db, .frozen_at = self.frozen_at },
-                        // a key-only entry is its own key slot, so its key is where the entry is
-                        .key_cursor = .{ .slot_ptr = .{ .position = kvKeyPosition(slot_ptr.slot) orelse slot_ptr.position, .slot = kv_pair.key_slot }, .db = self.db, .frozen_at = self.frozen_at },
+                        .key_cursor = .{ .slot_ptr = .{ .position = key_position, .slot = kv_pair.key_slot }, .db = self.db, .frozen_at = self.frozen_at },
                         .hash = kv_pair.hash,
                     };
                 }
