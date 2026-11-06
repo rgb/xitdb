@@ -1069,8 +1069,9 @@ pub fn Database(comptime db_kind: DatabaseKind, comptime HashInt: type) type {
                             var header_ptr = slot_ptr.slot.value;
                             // copy the header into this transaction unless it was made in it,
                             // so past moments still pointing at the old header are unaffected.
-                            // b-tree nodes are always appended, so only the header (updated in
-                            // place by later operations in this tx) needs copying.
+                            // b-tree nodes from past transactions are never changed in place
+                            // (see `btreeWriteNode`), so only the header (updated in place by
+                            // later operations in this tx) needs copying.
                             if (try self.isOld(header_ptr, frozen_at)) {
                                 var reader = self.core.reader();
                                 try reader.seekTo(header_ptr);
@@ -1976,9 +1977,10 @@ pub fn Database(comptime db_kind: DatabaseKind, comptime HashInt: type) type {
             return node;
         }
 
-        // always appends the node as a fresh block and returns its position.
-        // b-tree mutations are persistent: every node on the path from the root
-        // is rewritten, while untouched subtrees are shared by pointer.
+        // writes the node as a block at `ptr`: at the end to append it (see
+        // `writeBTreeNode`), or over a node made in this transaction to change it
+        // in place (see `btreeWriteNode`). a node from a past transaction is never
+        // changed, so untouched subtrees can be shared by pointer.
         fn writeBTreeNodeAt(self: *Database(db_kind, HashInt), node: BTreeNode, ptr: u64) !void {
             // write the whole block at once, so a file-based db doesn't need a system
             // call per field
