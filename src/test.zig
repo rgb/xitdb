@@ -1671,6 +1671,31 @@ fn testLowLevelApi(allocator: std.mem.Allocator, comptime db_kind: xitdb.Databas
             try std.testing.expectEqualStrings("shortstr", bar_value);
         }
 
+        // a reader gives the value its cursor was made with, like readBytes,
+        // even if the slot was overwritten since then
+        {
+            const Ctx = struct {
+                pub fn run(_: @This(), cursor: *xitdb.Database(db_kind, HashInt).Cursor(.read_write)) !void {
+                    var old_cursor = cursor.*;
+                    try cursor.write(.{ .bytes = "changed" });
+
+                    var buffer: [8]u8 = undefined;
+                    try std.testing.expectEqualStrings("shortstr", try old_cursor.readBytes(&buffer));
+                    var old_reader = try old_cursor.reader(&.{});
+                    try std.testing.expectEqual(8, try old_reader.interface.readSliceShort(&buffer));
+                    try std.testing.expectEqualStrings("shortstr", &buffer);
+                }
+            };
+            _ = try root_cursor.writePath(Ctx, &.{
+                .array_list_init,
+                .array_list_append,
+                .{ .write = .{ .slot = try root_cursor.readPathSlot(void, &.{.{ .array_list_get = -1 }}) } },
+                .{ .hash_map_init = .{} },
+                .{ .hash_map_get = .{ .value = bar_key } },
+                .{ .ctx = Ctx{} },
+            });
+        }
+
         // write bytes with a format tag
         {
             // shortstr
@@ -1735,6 +1760,20 @@ fn testLowLevelApi(allocator: std.mem.Allocator, comptime db_kind: xitdb.Databas
                 const bar_value = try bar_reader.interface.allocRemaining(allocator, .limited(MAX_READ_BYTES));
                 defer allocator.free(bar_value);
                 try std.testing.expectEqualStrings("shorts", bar_value);
+
+                // the value is in the slot, so a cursor with no position can be
+                // read with a reader too. the format tag is not part of the value.
+                var slot_cursor = xitdb.Database(db_kind, HashInt).Cursor(.read_only){
+                    .slot_ptr = .{ .position = null, .slot = try bar_cursor.slot() },
+                    .db = bar_cursor.db,
+                };
+                var slot_reader = try slot_cursor.reader(&.{});
+                var slot_buffer: [8]u8 = undefined;
+                try std.testing.expectEqual(6, try slot_reader.interface.readSliceShort(&slot_buffer));
+                try std.testing.expectEqualStrings("shorts", slot_buffer[0..6]);
+                try slot_reader.seekTo(4);
+                try std.testing.expectEqual(2, try slot_reader.interface.readSliceShort(&slot_buffer));
+                try std.testing.expectEqualStrings("ts", slot_buffer[0..2]);
             }
 
             // short
@@ -3550,6 +3589,19 @@ fn testSortedMap(allocator: std.mem.Allocator, comptime db_kind: xitdb.DatabaseK
                     n += 1;
                 }
                 try std.testing.expectEqual(3, n);
+            }
+
+            // a short key is stored in a slot, and its cursor has no position.
+            // it can be read with a reader like a long key.
+            {
+                var key_cursor = (try set.map.cursor.readPath(void, &.{
+                    .{ .sorted_map_get = .{ .key = "mid" } },
+                })).?;
+                try std.testing.expectEqual(null, key_cursor.slot_ptr.position);
+                var rbuf: [8]u8 = undefined;
+                var key_reader = try key_cursor.reader(&rbuf);
+                try std.testing.expectEqualStrings("mid", try key_reader.interface.take(3));
+                try std.testing.expectError(error.EndOfStream, key_reader.interface.takeByte());
             }
             try std.testing.expect(try set.remove("mid"));
             try std.testing.expectEqual(2, try set.count());
