@@ -3321,7 +3321,7 @@ pub fn Database(comptime db_kind: DatabaseKind, comptime HashInt: type) type {
                     var core_reader = self.db.core.reader();
 
                     switch (slot_ptr.slot.tag) {
-                        .none => return if (buffer.len == 0) .{ .value = buffer } else error.EndOfStream,
+                        .none => return .{ .value = buffer[0..0] },
                         .bytes => {
                             try core_reader.seekTo(slot_ptr.slot.value);
                             const value_size = try takeInt(&core_reader.interface, u64, .big);

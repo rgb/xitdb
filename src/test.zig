@@ -2502,6 +2502,20 @@ fn testLowLevelApi(allocator: std.mem.Allocator, comptime db_kind: xitdb.Databas
                 i += 1;
             }
             try std.testing.expectEqual(10, i);
+
+            // a .none slot is read as an empty byte array,
+            // whether or not the buffer has room for more
+            const none_cursor = (try inner_cursor.readPath(void, &.{
+                .{ .array_list_get = 0 },
+            })).?;
+            try std.testing.expectEqual(.none, (try none_cursor.slot()).tag);
+            const none_value = try none_cursor.readBytesAlloc(allocator, MAX_READ_BYTES);
+            defer allocator.free(none_value);
+            try std.testing.expectEqualStrings("", none_value);
+            var none_buffer: [8]u8 = undefined;
+            try std.testing.expectEqualStrings("", try none_cursor.readBytes(&none_buffer));
+            try std.testing.expectEqualStrings("", try none_cursor.readBytes(&.{}));
+            try std.testing.expectEqual(null, (try none_cursor.readBytesObject(&none_buffer)).format_tag);
         }
 
         // get list slot
