@@ -319,6 +319,8 @@ const big_cities = try DB.ArrayList(.read_only).init(big_cities_cursor);
 try std.testing.expectEqual(2, try big_cities.count());
 ```
 
+Freezing globally with `cursor.db.freeze()` is different in one way: it makes everything the transaction has written so far immutable for every cursor, including the collections you are still holding. Before you write to them again, initialize them again, starting with the moment's `HashMap`, and get the nested cursors from it again with `putCursor`. Concatenating a `LinkedArrayList` with `concat` freezes globally in the same way, because the new list shares its nodes with both of the lists it was made from, so do the same after a `concat`. A collection that is written to without doing this still uses what it had before the freeze. Its writes can be lost, or can show up in a clone that the freeze was meant to protect, and it can return an error (`InvalidBTreeNode`, or `InvalidCount` for a counted hash map) because its count no longer matches its contents.
+
 ## Sorting and Paginating
 
 The `Hash`-based structures are great for looking data up by key, but they store their contents in hash order, which is meaningless to a human. Real apps need to show data in a sensible order (such as users listed alphabetically) one page at a time. Relational databases like SQLite have this built-in: you declare a `CREATE INDEX`, write `ORDER BY username LIMIT 20 OFFSET 40`, and the query planner maintains the index for you.
