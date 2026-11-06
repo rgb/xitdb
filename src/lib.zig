@@ -1188,11 +1188,6 @@ pub fn Database(comptime db_kind: DatabaseKind, comptime HashInt: type) type {
                     try reader.seekTo(linked_array_list_concat.list.value);
                     const header_b: BTreeHeader = @bitCast(try takeInt(&reader.interface, BTreeHeaderInt, .big));
 
-                    // the join result shares subtrees with both operands (and the
-                    // second operand stays live), so freeze everything created so far:
-                    // later in-place mutations will then copy those nodes instead of
-                    // overwriting a node that is still referenced elsewhere.
-                    self.tx_start = try self.core.length();
                     const new_root_ptr = try self.btreeJoin(header_a.root_ptr, header_b.root_ptr);
 
                     // update the header before recursing into the rest of the path, so
@@ -1200,6 +1195,14 @@ pub fn Database(comptime db_kind: DatabaseKind, comptime HashInt: type) type {
                     var writer = self.core.writer();
                     try writer.seekTo(header_ptr);
                     try writer.interface.writeInt(BTreeHeaderInt, @bitCast(BTreeHeader{ .root_ptr = new_root_ptr, .size = header_a.size + header_b.size }), .big);
+
+                    // the join result shares subtrees with both operands (and the
+                    // second operand stays live), so freeze everything created so far:
+                    // later in-place mutations will then copy those nodes instead of
+                    // overwriting a node that is still referenced elsewhere. the nodes
+                    // made by the join are frozen too, because the header is: an init
+                    // copies a frozen header, and the copy shares its nodes.
+                    self.tx_start = try self.core.length();
 
                     return self.readSlotPointer(write_mode, Ctx, path[1..], slot_ptr, frozen_at);
                 },
