@@ -2748,6 +2748,44 @@ fn testLowLevelApi(allocator: std.mem.Allocator, comptime db_kind: xitdb.Databas
         });
     }
 
+    // a concat freezes the nodes it makes
+    {
+        try clearStorage(db_kind, init_opts);
+        const DB = xitdb.Database(db_kind, HashInt);
+        var db = try DB.init(std.testing.io, init_opts);
+        const history = try DB.ArrayList(.read_write).init(db.rootCursor());
+
+        const Ctx = struct {
+            pub fn run(_: @This(), cursor: *DB.Cursor(.read_write)) !void {
+                const moment = try DB.HashMap(.read_write).init(cursor.*);
+
+                const list = try DB.LinkedArrayList(.read_write).init(try moment.putCursor(hashInt("list")));
+                try list.append(.{ .uint = 1 });
+                try list.concat(try list.slot());
+                const list_slot = try list.slot();
+
+                // the concat froze the list's header, so initializing the list
+                // again copies it. the copy shares the nodes the concat made,
+                // so a change through it must copy them as well.
+                const list_again = try DB.LinkedArrayList(.read_write).init(try moment.putCursor(hashInt("list")));
+                try list_again.remove(0);
+                try std.testing.expectEqual(1, try list_again.count());
+
+                // a clone of the slot from before the change has both items
+                var clone_cursor = try moment.putCursor(hashInt("clone"));
+                try clone_cursor.write(.{ .slot = list_slot });
+                const clone = try DB.LinkedArrayList(.read_write).init(clone_cursor);
+                try std.testing.expectEqual(2, try clone.count());
+                try std.testing.expectEqual(1, try (try clone.getCursor(1)).?.readUint());
+                try clone.append(.{ .uint = 2 });
+                try std.testing.expectEqual(3, try clone.count());
+                try std.testing.expectEqual(2, try (try clone.getCursor(-1)).?.readUint());
+                try std.testing.expectEqual(1, try list_again.count());
+            }
+        };
+        try history.appendContext(.{ .slot = try history.getSlot(-1) }, Ctx{});
+    }
+
     // append items to linked_array_list without setting their value
     {
         try clearStorage(db_kind, init_opts);
