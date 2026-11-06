@@ -2774,6 +2774,55 @@ fn testLowLevelApi(allocator: std.mem.Allocator, comptime db_kind: xitdb.Databas
     }
 }
 
+test "concat freezes the nodes it makes" {
+    const allocator = std.testing.allocator;
+    const DB = xitdb.Database(.memory, HashInt);
+
+    var buffer = std.Io.Writer.Allocating.init(allocator);
+    defer buffer.deinit();
+    var db = try DB.init(std.testing.io, .{ .buffer = &buffer, .max_size = 50_000 });
+    const history = try DB.ArrayList(.read_write).init(db.rootCursor());
+
+    const Ctx = struct {
+        pub fn run(_: @This(), cursor: *DB.Cursor(.read_write)) !void {
+            const moment = try DB.HashMap(.read_write).init(cursor.*);
+
+            const list = try DB.LinkedArrayList(.read_write).init(try moment.putCursor(hashInt("list")));
+            try list.append(.{ .uint = 1 });
+            try list.append(.{ .uint = 2 });
+            const other = try DB.LinkedArrayList(.read_write).init(try moment.putCursor(hashInt("other")));
+            try other.append(.{ .uint = 3 });
+            try list.concat(try other.slot());
+
+            // clone the list
+            var clone_cursor = try moment.putCursor(hashInt("clone"));
+            try clone_cursor.write(.{ .slot = try list.slot() });
+
+            // the concat froze the list's header, so initializing the list
+            // again copies it. the copy shares the nodes the concat made,
+            // so a change through it must copy them as well.
+            const list_again = try DB.LinkedArrayList(.read_write).init(try moment.putCursor(hashInt("list")));
+            try list_again.remove(0);
+        }
+    };
+    try history.appendContext(.{ .slot = try history.getSlot(-1) }, Ctx{});
+
+    const moment = try DB.HashMap(.read_only).init((try history.getCursor(-1)).?);
+
+    // the list lost its first item
+    const list = try DB.LinkedArrayList(.read_only).init((try moment.getCursor(hashInt("list"))).?);
+    try std.testing.expectEqual(2, try list.count());
+    try std.testing.expectEqual(2, try (try list.getCursor(0)).?.readUint());
+    try std.testing.expectEqual(3, try (try list.getCursor(1)).?.readUint());
+
+    // ...but the clone still has all three
+    const clone = try DB.LinkedArrayList(.read_only).init((try moment.getCursor(hashInt("clone"))).?);
+    try std.testing.expectEqual(3, try clone.count());
+    try std.testing.expectEqual(1, try (try clone.getCursor(0)).?.readUint());
+    try std.testing.expectEqual(2, try (try clone.getCursor(1)).?.readUint());
+    try std.testing.expectEqual(3, try (try clone.getCursor(2)).?.readUint());
+}
+
 test "compaction" {
     const io = std.testing.io;
     const allocator = std.testing.allocator;
