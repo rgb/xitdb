@@ -3897,6 +3897,343 @@ fn testIteratorFrom(allocator: std.mem.Allocator, comptime db_kind: xitdb.Databa
     }
 }
 
+fn expectUints(list: anytype, expected: []const u64) !void {
+    try std.testing.expectEqual(@as(u64, expected.len), try list.count());
+    for (expected, 0..) |value, i| {
+        try std.testing.expectEqual(value, try (try list.getCursor(@intCast(i))).?.readUint());
+    }
+}
+
+// a freeze makes everything the transaction wrote so far immutable. that
+// includes the header of every collection and the entry that points at it,
+// which is why collections must be initialized again after `Database.freeze`,
+// and after a concat, which freezes too. a collection that is kept instead
+// still writes through its old header and its old entry. this is what that
+// does: its writes are lost or shared, and when its header ends up disagreeing
+// with its tree, it gets an error.
+test "collections kept across a freeze" {
+    const allocator = std.testing.allocator;
+    const DB = xitdb.Database(.memory, HashInt);
+    const Moment = DB.HashMap(.read_write);
+    const List = DB.LinkedArrayList(.read_write);
+
+    const Freeze = enum {
+        database,
+        concat,
+        concat_elsewhere,
+
+        // `Database.freeze`, a concat of `list`, or a concat of another list
+        fn run(self: @This(), cursor: *DB.Cursor(.read_write), moment: Moment, list: ?List) !void {
+            const other = try List.init(try moment.putCursor(hashInt("other")));
+            switch (self) {
+                .database => try cursor.db.freeze(),
+                .concat => try list.?.concat(try other.slot()),
+                .concat_elsewhere => try other.concat(try other.slot()),
+            }
+        }
+    };
+
+    var buffer = std.Io.Writer.Allocating.init(allocator);
+    defer buffer.deinit();
+    var db = try DB.init(std.testing.io, .{ .buffer = &buffer, .max_size = 50_000_000 });
+    const history = try DB.ArrayList(.read_write).init(db.rootCursor());
+
+    // a list that is initialized again is a copy of the one before the freeze,
+    // and a slot read before the freeze keeps what it had
+    {
+        const Ctx = struct {
+            freeze: Freeze,
+
+            pub fn run(self: @This(), cursor: *DB.Cursor(.read_write)) !void {
+                var moment = try Moment.init(cursor.*);
+                var list = try List.init(try moment.putCursor(hashInt("list")));
+                try list.append(.{ .uint = 1 });
+                try list.append(.{ .uint = 2 });
+                const slot_before = try list.slot();
+
+                try self.freeze.run(cursor, moment, list);
+                moment = try Moment.init(cursor.*);
+                list = try List.init(try moment.putCursor(hashInt("list")));
+                try list.append(.{ .uint = 3 });
+                try list.remove(0);
+                try expectUints(list, &.{ 2, 3 });
+
+                var clone_cursor = try moment.putCursor(hashInt("clone"));
+                try clone_cursor.write(.{ .slot = slot_before });
+                const clone = try List.init(clone_cursor);
+                try clone.append(.{ .uint = 4 });
+                try expectUints(clone, &.{ 1, 2, 4 });
+                try expectUints(list, &.{ 2, 3 });
+            }
+        };
+        for (std.enums.values(Freeze)) |freeze| {
+            try history.appendContext(.{ .slot = null }, Ctx{ .freeze = freeze });
+        }
+    }
+
+    // a kept list writes through the entry it was made with. once the map has
+    // a new entry for the list, it doesn't see what the kept list writes.
+    {
+        const Ctx = struct {
+            freeze: Freeze,
+
+            pub fn run(self: @This(), cursor: *DB.Cursor(.read_write)) !void {
+                const moment = try Moment.init(cursor.*);
+                const list = try List.init(try moment.putCursor(hashInt("list")));
+                try list.append(.{ .uint = 1 });
+                try list.append(.{ .uint = 2 });
+
+                try self.freeze.run(cursor, moment, list);
+                const list_again = try List.init(try moment.putCursor(hashInt("list")));
+                try list_again.remove(0);
+                try list.append(.{ .uint = 3 });
+                try expectUints(list, &.{ 1, 2, 3 });
+                try expectUints(list_again, &.{2});
+            }
+        };
+        for (std.enums.values(Freeze)) |freeze| {
+            try history.appendContext(.{ .slot = null }, Ctx{ .freeze = freeze });
+        }
+    }
+
+    // if the kept list writes before the list is initialized again, the second
+    // header is a copy of the first, over a node that both can change in place.
+    // the kept list's header then counts entries that the node doesn't have.
+    {
+        const Ctx = struct {
+            freeze: Freeze,
+
+            pub fn run(self: @This(), cursor: *DB.Cursor(.read_write)) !void {
+                const moment = try Moment.init(cursor.*);
+                const list = try List.init(try moment.putCursor(hashInt("list")));
+                try list.append(.{ .uint = 1 });
+                try list.append(.{ .uint = 2 });
+                try list.append(.{ .uint = 3 });
+
+                try self.freeze.run(cursor, moment, list);
+                try list.append(.{ .uint = 4 });
+                try expectUints(list, &.{ 1, 2, 3, 4 });
+                const list_again = try List.init(try moment.putCursor(hashInt("list")));
+                try list_again.remove(0);
+                try list_again.remove(0);
+                try expectUints(list_again, &.{ 3, 4 });
+
+                try std.testing.expectEqual(4, try list.count());
+                try std.testing.expectEqual(3, try (try list.getCursor(0)).?.readUint());
+                try std.testing.expectError(error.InvalidBTreeNode, list.getCursor(2));
+                try std.testing.expectError(error.InvalidBTreeNode, list.append(.{ .uint = 5 }));
+                try std.testing.expectError(error.InvalidBTreeNode, list.insert(3, .{ .uint = 5 }));
+                try std.testing.expectError(error.InvalidBTreeNode, list.put(3, .{ .uint = 5 }));
+                try std.testing.expectError(error.InvalidBTreeNode, list.remove(3));
+                try std.testing.expectError(error.InvalidBTreeNode, list.slice(0, 4));
+                try std.testing.expectError(error.InvalidBTreeNode, list.iteratorFrom(3));
+                try expectUints(list_again, &.{ 3, 4 });
+            }
+        };
+        for (std.enums.values(Freeze)) |freeze| {
+            try history.appendContext(.{ .slot = null }, Ctx{ .freeze = freeze });
+        }
+    }
+
+    // a clone from before the freeze shares the kept list's header, so it
+    // changes with the kept list. a clone from after the kept list's write gets
+    // a copy of the header, over the node that the kept list can change in place.
+    {
+        const Ctx = struct {
+            freeze: Freeze,
+
+            pub fn run(self: @This(), cursor: *DB.Cursor(.read_write)) !void {
+                const moment = try Moment.init(cursor.*);
+                const list = try List.init(try moment.putCursor(hashInt("list")));
+                try list.append(.{ .uint = 1 });
+                var early_cursor = try moment.putCursor(hashInt("early"));
+                try early_cursor.write(.{ .slot = try list.slot() });
+
+                try self.freeze.run(cursor, moment, list);
+                try list.append(.{ .uint = 2 });
+                const early = try DB.LinkedArrayList(.read_only).init((try moment.getCursor(hashInt("early"))).?);
+                try expectUints(early, &.{ 1, 2 });
+
+                var late_cursor = try moment.putCursor(hashInt("late"));
+                try late_cursor.write(.{ .slot = try list.slot() });
+                const late = try List.init(late_cursor);
+                try late.remove(0);
+                try expectUints(late, &.{2});
+                try std.testing.expectError(error.InvalidBTreeNode, list.append(.{ .uint = 3 }));
+            }
+        };
+        for (std.enums.values(Freeze)) |freeze| {
+            try history.appendContext(.{ .slot = null }, Ctx{ .freeze = freeze });
+        }
+    }
+
+    // a sorted map has a header over a tree too
+    {
+        const Ctx = struct {
+            freeze: Freeze,
+
+            pub fn run(self: @This(), cursor: *DB.Cursor(.read_write)) !void {
+                const moment = try Moment.init(cursor.*);
+                const map = try DB.SortedMap(.read_write).init(try moment.putCursor(hashInt("map")));
+                var kbuf: [8]u8 = undefined;
+                for (0..40) |i| {
+                    try map.put(try std.mem.print(&kbuf, "k{d:0>3}", .{i}), .{ .uint = @intCast(i) });
+                }
+
+                try self.freeze.run(cursor, moment, null);
+                try map.put("k999", .{ .uint = 999 });
+                const map_again = try DB.SortedMap(.read_write).init(try moment.putCursor(hashInt("map")));
+                for (0..36) |i| {
+                    try std.testing.expect(try map_again.remove(try std.mem.print(&kbuf, "k{d:0>3}", .{i})));
+                }
+                try std.testing.expectEqual(5, try map_again.count());
+
+                // the kept map's header counts 41 keys, in a tree that has 5
+                try std.testing.expectEqual(41, try map.count());
+                try std.testing.expectError(error.InvalidBTreeNode, map.getIndexKeyValuePair(40));
+                try std.testing.expectError(error.InvalidBTreeNode, map.iteratorFromIndex(30));
+
+                // after one more key from the kept map, the second header
+                // counts one key less than the tree has
+                try map.put("k998", .{ .uint = 998 });
+                for ([_][]const u8{ "k036", "k037", "k038", "k039", "k998" }) |key| {
+                    try std.testing.expect(try map_again.remove(key));
+                }
+                try std.testing.expectEqual(0, try map_again.count());
+                try std.testing.expectError(error.InvalidBTreeNode, map_again.remove("k999"));
+            }
+        };
+        for ([_]Freeze{ .database, .concat_elsewhere }) |freeze| {
+            try history.appendContext(.{ .slot = null }, Ctx{ .freeze = freeze });
+        }
+    }
+
+    // a counted hash map's count is copied with its root block when it is
+    // initialized again, and they share the blocks below
+    {
+        const Ctx = struct {
+            freeze: Freeze,
+
+            pub fn run(self: @This(), cursor: *DB.Cursor(.read_write)) !void {
+                const moment = try Moment.init(cursor.*);
+                const counted = try DB.CountedHashMap(.read_write).init(try moment.putCursor(hashInt("counted")));
+                // these hashes end with the same four bits, so they are in a block below the root
+                try counted.put(0x01, .{ .uint = 1 });
+                try counted.put(0x11, .{ .uint = 2 });
+
+                try self.freeze.run(cursor, moment, null);
+                try counted.put(0x21, .{ .uint = 3 });
+                const counted_again = try DB.CountedHashMap(.read_write).init(try moment.putCursor(hashInt("counted")));
+                try counted.put(0x31, .{ .uint = 4 });
+
+                // the second count is 3, in a map that has 4 keys
+                try std.testing.expectEqual(3, try counted_again.count());
+                for ([_]HashInt{ 0x01, 0x11, 0x21 }) |hash| {
+                    try std.testing.expect(try counted_again.remove(hash));
+                }
+                try std.testing.expectEqual(0, try counted_again.count());
+                try std.testing.expectError(error.InvalidCount, counted_again.remove(0x31));
+            }
+        };
+        for ([_]Freeze{ .database, .concat_elsewhere }) |freeze| {
+            try history.appendContext(.{ .slot = null }, Ctx{ .freeze = freeze });
+        }
+    }
+
+    // an array list has no tree that its header could disagree with. a kept one
+    // shares what it wrote after the freeze with the one that is initialized again.
+    {
+        const Ctx = struct {
+            freeze: Freeze,
+
+            pub fn run(self: @This(), cursor: *DB.Cursor(.read_write)) !void {
+                const moment = try Moment.init(cursor.*);
+                const array = try DB.ArrayList(.read_write).init(try moment.putCursor(hashInt("array")));
+                for (0..20) |i| {
+                    try array.append(.{ .uint = @intCast(i) });
+                }
+
+                try self.freeze.run(cursor, moment, null);
+                try array.append(.{ .uint = 20 });
+                const array_again = try DB.ArrayList(.read_write).init(try moment.putCursor(hashInt("array")));
+                try array_again.put(20, .{ .uint = 99 });
+                try std.testing.expectEqual(99, try (try array.getCursor(20)).?.readUint());
+            }
+        };
+        for ([_]Freeze{ .database, .concat_elsewhere }) |freeze| {
+            try history.appendContext(.{ .slot = null }, Ctx{ .freeze = freeze });
+        }
+    }
+}
+
+// a node that doesn't have what its parent expects of it is an error as well
+test "invalid b-tree nodes" {
+    const allocator = std.testing.allocator;
+    const DB = xitdb.Database(.memory, HashInt);
+    const Moment = DB.HashMap(.read_write);
+    const List = DB.LinkedArrayList(.read_write);
+    const Sorted = DB.SortedMap(.read_write);
+
+    var buffer = std.Io.Writer.Allocating.init(allocator);
+    defer buffer.deinit();
+    var db = try DB.init(std.testing.io, .{ .buffer = &buffer, .max_size = 50_000_000 });
+    const history = try DB.ArrayList(.read_write).init(db.rootCursor());
+
+    // a list and a sorted map with enough entries for their root to be a branch
+    {
+        const Ctx = struct {
+            pub fn run(_: @This(), cursor: *DB.Cursor(.read_write)) !void {
+                const moment = try Moment.init(cursor.*);
+                const list = try List.init(try moment.putCursor(hashInt("list")));
+                const map = try Sorted.init(try moment.putCursor(hashInt("map")));
+                var kbuf: [8]u8 = undefined;
+                for (0..xitdb.SLOT_COUNT + 1) |i| {
+                    try list.append(.{ .uint = @intCast(i) });
+                    try map.put(try std.mem.print(&kbuf, "k{d:0>2}", .{i}), .{ .uint = @intCast(i) });
+                }
+                const short_list = try List.init(try moment.putCursor(hashInt("short-list")));
+                try short_list.append(.{ .uint = 0 });
+            }
+        };
+        try history.appendContext(.{ .slot = null }, Ctx{});
+    }
+
+    // a header is the size followed by the position of the root node
+    const committed = try DB.HashMap(.read_only).init((try history.getCursor(-1)).?);
+    var reader = db.core.reader();
+    try reader.seekTo((try committed.getSlot(hashInt("list"))).?.value + 8);
+    const list_root = try takeInt(&reader.interface, u64, .big);
+    try reader.seekTo((try committed.getSlot(hashInt("map"))).?.value + 8);
+    const map_root = try takeInt(&reader.interface, u64, .big);
+
+    // a node is its kind, its number of entries, and then its slots. change the
+    // list's root to have no children, and the sorted map's root to count no
+    // keys below its first child (the counts follow the children and separators).
+    var writer = db.core.writer();
+    try writer.seekTo(list_root + 1);
+    try writer.interface.writeByte(0);
+    try writer.seekTo(map_root + 2 + 2 * xitdb.SLOT_COUNT * 9);
+    try writer.interface.writeInt(u64, 0, .big);
+
+    {
+        const Ctx = struct {
+            pub fn run(_: @This(), cursor: *DB.Cursor(.read_write)) !void {
+                const moment = try Moment.init(cursor.*);
+                const list = try List.init(try moment.putCursor(hashInt("list")));
+                const short_list = try List.init(try moment.putCursor(hashInt("short-list")));
+                const map = try Sorted.init(try moment.putCursor(hashInt("map")));
+
+                try std.testing.expectError(error.InvalidBTreeNode, list.remove(0));
+                try std.testing.expectError(error.InvalidBTreeNode, list.slice(1, 2));
+                try std.testing.expectError(error.InvalidBTreeNode, list.concat(try short_list.slot()));
+                try std.testing.expectError(error.InvalidBTreeNode, short_list.concat(try list.slot()));
+                try std.testing.expectError(error.InvalidBTreeNode, map.remove("k00"));
+            }
+        };
+        try history.appendContext(.{ .slot = try history.getSlot(-1) }, Ctx{});
+    }
+}
+
 test "replication" {
     const io = std.testing.io;
     const allocator = std.testing.allocator;
