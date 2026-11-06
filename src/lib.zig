@@ -3400,6 +3400,19 @@ pub fn Database(comptime db_kind: DatabaseKind, comptime HashInt: type) type {
                     var core_reader = self.db.core.reader();
 
                     switch (slot_ptr.slot.tag) {
+                        // an empty stream, like the empty value from `readBytes`
+                        .none => return .{
+                            .parent = self,
+                            .interface = .{
+                                .vtable = &.{ .stream = Reader.stream },
+                                .buffer = buffer,
+                                .seek = 0,
+                                .end = 0,
+                            },
+                            .size = 0,
+                            .start_position = 0,
+                            .pos = 0,
+                        },
                         .bytes => {
                             try core_reader.seekTo(slot_ptr.slot.value);
                             const size: u64 = @intCast(try takeInt(&core_reader.interface, u64, .big));
