@@ -3642,6 +3642,37 @@ fn testSortedMap(allocator: std.mem.Allocator, comptime db_kind: xitdb.DatabaseK
                 .{ .write = .{ .bytes = "x" } },
             }));
 
+            // nor through the key cursor of an entry. the key can still be read,
+            // and the value can still be written.
+            {
+                const entry_cursor = try map.cursor.writePath(void, &.{
+                    .{ .sorted_map_get = .{ .kv_pair = "k0003" } },
+                });
+                var kv = try entry_cursor.readKeyValuePair();
+                try std.testing.expectError(error.CursorNotWriteable, kv.key_cursor.write(.{ .bytes = "k9999" }));
+                var key_writer = try kv.key_cursor.writer(&.{});
+                try key_writer.interface.writeAll("k9999");
+                try std.testing.expectError(error.CursorNotWriteable, key_writer.finish());
+
+                var kbuf: [8]u8 = undefined;
+                try std.testing.expectEqualStrings("k0003", try kv.key_cursor.readBytes(&kbuf));
+                var key_reader = try kv.key_cursor.reader(&.{});
+                try std.testing.expectEqual(5, try key_reader.interface.readSliceShort(&kbuf));
+                try std.testing.expectEqualStrings("k0003", kbuf[0..5]);
+
+                try kv.value_cursor.write(.{ .uint = 300 });
+                try std.testing.expectEqual(300, try (try map.getCursor("k0003")).?.readUint());
+                try kv.value_cursor.write(.{ .uint = 3 }); // restore the map for the assertions below
+
+                // a hash map isn't ordered by its keys, so they are still writeable this way
+                const hash_entry_cursor = try moment.cursor.writePath(void, &.{
+                    .{ .hash_map_get = .{ .kv_pair = hashInt("map") } },
+                });
+                var hash_kv = try hash_entry_cursor.readKeyValuePair();
+                try hash_kv.key_cursor.write(.{ .bytes = "map" });
+                try std.testing.expectEqualStrings("map", try (try moment.getKeyCursor(hashInt("map"))).?.readBytes(&kbuf));
+            }
+
             // a write that fails after the key is inserted (a missing key written
             // through the non-writeable key slot) must still leave the count
             // consistent with the tree, not inserted-but-uncounted
