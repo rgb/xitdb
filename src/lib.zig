@@ -1469,6 +1469,8 @@ pub fn Database(comptime db_kind: DatabaseKind, comptime HashInt: type) type {
                         var writer = self.core.writer();
                         try reader.seekTo(slot_ptr.slot.value);
                         const map_count = try takeInt(&reader.interface, u64, .big);
+                        // the key was found in a map whose count says it is empty
+                        if (map_count == 0) return error.InvalidCount;
                         try writer.seekTo(slot_ptr.slot.value);
                         try writer.interface.writeInt(u64, map_count - 1, .big);
                     }
@@ -1595,6 +1597,8 @@ pub fn Database(comptime db_kind: DatabaseKind, comptime HashInt: type) type {
 
                     const result = try self.sortedRemove(header.root_ptr, key, frozen_at);
                     if (!result.found) return error.KeyNotFound;
+                    // the key was found in a map that the header says is empty
+                    if (header.size == 0) return error.InvalidBTreeNode;
 
                     var writer = self.core.writer();
                     try writer.seekTo(header_ptr);
@@ -2344,6 +2348,7 @@ pub fn Database(comptime db_kind: DatabaseKind, comptime HashInt: type) type {
                     node.values[node.num] = .{};
                 },
                 .branch => {
+                    if (node.num == 0) return error.InvalidBTreeNode;
                     var i: u8 = 0;
                     var rem = rank;
                     while (i + 1 < node.num and rem >= node.counts[i]) : (i += 1) {
@@ -2498,6 +2503,7 @@ pub fn Database(comptime db_kind: DatabaseKind, comptime HashInt: type) type {
         // join b (shorter) into the rightmost spine of a (taller), at height hb
         fn btreeJoinRight(self: *Database(db_kind, HashInt), a_ptr: u64, ha: u8, b_ptr: u64, hb: u8) anyerror!BTreeJoinResult {
             const a = try self.readBTreeNode(a_ptr);
+            if (a.num == 0) return error.InvalidBTreeNode;
             const last = a.num - 1;
             const sub = if (ha - 1 == hb)
                 try self.btreeMergeNodes(try self.readBTreeNode(a.children[last].value), try self.readBTreeNode(b_ptr))
@@ -2522,6 +2528,7 @@ pub fn Database(comptime db_kind: DatabaseKind, comptime HashInt: type) type {
         // join a (shorter) into the leftmost spine of b (taller), at height ha
         fn btreeJoinLeft(self: *Database(db_kind, HashInt), a_ptr: u64, ha: u8, b_ptr: u64, hb: u8) anyerror!BTreeJoinResult {
             const b = try self.readBTreeNode(b_ptr);
+            if (b.num == 0) return error.InvalidBTreeNode;
             const sub = if (hb - 1 == ha)
                 try self.btreeMergeNodes(try self.readBTreeNode(a_ptr), try self.readBTreeNode(b.children[0].value))
             else
@@ -2583,6 +2590,7 @@ pub fn Database(comptime db_kind: DatabaseKind, comptime HashInt: type) type {
                     return .{ .left = try self.writeBTreeNode(left), .right = try self.writeBTreeNode(right) };
                 },
                 .branch => {
+                    if (node.num == 0) return error.InvalidBTreeNode;
                     var i: u8 = 0;
                     var rem = rank;
                     while (i + 1 < node.num and rem > node.counts[i]) : (i += 1) {
@@ -3017,6 +3025,7 @@ pub fn Database(comptime db_kind: DatabaseKind, comptime HashInt: type) type {
 
                     var branch = node;
                     branch.children[i] = .{ .value = child.node_ptr, .tag = .index };
+                    if (branch.counts[i] == 0) return error.InvalidBTreeNode;
                     branch.counts[i] -= 1;
                     const ptr = try self.sortedWriteNode(branch, node_ptr, frozen_at);
                     return .{ .node_ptr = ptr, .found = true };
