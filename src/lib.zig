@@ -3485,7 +3485,19 @@ pub fn Database(comptime db_kind: DatabaseKind, comptime HashInt: type) type {
                 }
 
                 pub fn writeIfEmpty(self: *Cursor(.read_write), data: WriteableData) !void {
-                    const slot_ptr = try self.resolved();
+                    var slot_ptr = try self.resolved();
+                    // another cursor may have changed the slot in place since this
+                    // one was made, so decide by what it holds now (see `writePath`).
+                    // an element that was appended or inserted and not written yet is
+                    // a `.none` slot marked `full`, while its cursor's slot is empty,
+                    // so a `.none` slot still counts as empty for a cursor whose slot is.
+                    if (slot_ptr.position) |position| {
+                        var core_reader = self.db.core.reader();
+                        try core_reader.seekTo(position);
+                        const current: Slot = @bitCast(try takeInt(&core_reader.interface, SlotInt, .big));
+                        try current.tag.validate();
+                        if (!slot_ptr.slot.empty() or current.tag != .none) slot_ptr.slot = current;
+                    }
                     if (slot_ptr.slot.empty()) {
                         try self.write(data);
                     }
