@@ -3406,7 +3406,15 @@ pub fn Database(comptime db_kind: DatabaseKind, comptime HashInt: type) type {
                 }
 
                 pub fn writeIfEmpty(self: *Cursor(.read_write), data: WriteableData) !void {
-                    const slot_ptr = try self.resolved();
+                    var slot_ptr = try self.resolved();
+                    // another cursor may have changed the slot in place since this
+                    // one was made, so decide by what it holds now (see `writePath`)
+                    if (slot_ptr.position) |position| {
+                        var core_reader = self.db.core.reader();
+                        try core_reader.seekTo(position);
+                        slot_ptr.slot = @bitCast(try takeInt(&core_reader.interface, SlotInt, .big));
+                        try slot_ptr.slot.tag.validate();
+                    }
                     if (slot_ptr.slot.empty()) {
                         try self.write(data);
                     }

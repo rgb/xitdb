@@ -4246,6 +4246,61 @@ test "invalid b-tree nodes" {
     }
 }
 
+test "write if empty goes by the slot as it is now" {
+    const allocator = std.testing.allocator;
+    const DB = xitdb.Database(.memory, HashInt);
+    const Moment = DB.HashMap(.read_write);
+
+    var buffer = std.Io.Writer.Allocating.init(allocator);
+    defer buffer.deinit();
+    var db = try DB.init(std.testing.io, .{ .buffer = &buffer, .max_size = 50_000_000 });
+    const history = try DB.ArrayList(.read_write).init(db.rootCursor());
+
+    // the cursor's slot is empty, but a put has filled it in place since
+    {
+        const Ctx = struct {
+            pub fn run(_: @This(), cursor: *DB.Cursor(.read_write)) !void {
+                const moment = try Moment.init(cursor.*);
+                var empty_cursor = try moment.putCursor(hashInt("key"));
+                try moment.put(hashInt("key"), .{ .bytes = "first" });
+                try empty_cursor.writeIfEmpty(.{ .bytes = "second" });
+                var value_buffer: [8]u8 = undefined;
+                try std.testing.expectEqualStrings("first", try (try moment.getCursor(hashInt("key"))).?.readBytes(&value_buffer));
+            }
+        };
+        try history.appendContext(.{ .slot = null }, Ctx{});
+    }
+
+    // the cursor's slot holds a value, but a remove has emptied it in place
+    // since. the value cursor's slot is inside the key-value pair, which the
+    // remove leaves as it is, so this takes a cursor to the map's own slot
+    // for the key.
+    {
+        const Ctx = struct {
+            pub fn run(_: @This(), cursor: *DB.Cursor(.read_write)) !void {
+                const moment = try Moment.init(cursor.*);
+                try moment.put(hashInt("key"), .{ .bytes = "first" });
+                var value_cursor = try moment.putCursor(hashInt("key"));
+                var pair_cursor = try moment.cursor.writePath(void, &.{.{ .hash_map_get = .{ .kv_pair = hashInt("key") } }});
+                const pair_slot = try pair_cursor.slot();
+                try std.testing.expect(try moment.remove(hashInt("key")));
+
+                // the key-value pair still holds the value, so nothing is written
+                try value_cursor.writeIfEmpty(.{ .bytes = "second" });
+                try std.testing.expect((try moment.getCursor(hashInt("key"))) == null);
+                var value_buffer: [8]u8 = undefined;
+                try std.testing.expectEqualStrings("first", try value_cursor.readBytes(&value_buffer));
+
+                // the map's slot for the key is empty, so the pair is put back
+                try pair_cursor.writeIfEmpty(.{ .slot = pair_slot });
+                try std.testing.expect((try moment.getCursor(hashInt("key"))) != null);
+                try std.testing.expectEqualStrings("first", try (try moment.getCursor(hashInt("key"))).?.readBytes(&value_buffer));
+            }
+        };
+        try history.appendContext(.{ .slot = null }, Ctx{});
+    }
+}
+
 test "replication" {
     const io = std.testing.io;
     const allocator = std.testing.allocator;
